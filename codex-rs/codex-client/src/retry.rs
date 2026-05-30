@@ -1,4 +1,6 @@
 use crate::error::TransportError;
+use crate::network_availability::NetworkAvailabilityWait;
+use crate::network_availability::wait_for_network_availability;
 use crate::request::Request;
 use rand::Rng;
 use std::future::Future;
@@ -48,12 +50,27 @@ pub fn backoff(base: Duration, attempt: u64) -> Duration {
 
 pub async fn run_with_retry<T, F, Fut>(
     policy: RetryPolicy,
-    mut make_req: impl FnMut() -> Request,
+    make_req: impl FnMut() -> Request,
     op: F,
 ) -> Result<T, TransportError>
 where
     F: Fn(Request, u64) -> Fut,
     Fut: Future<Output = Result<T, TransportError>>,
+{
+    run_with_retry_waiting_for_network(policy, make_req, op, wait_for_network_availability).await
+}
+
+async fn run_with_retry_waiting_for_network<T, F, Fut, W, WFut>(
+    policy: RetryPolicy,
+    mut make_req: impl FnMut() -> Request,
+    op: F,
+    mut wait_for_network: W,
+) -> Result<T, TransportError>
+where
+    F: Fn(Request, u64) -> Fut,
+    Fut: Future<Output = Result<T, TransportError>>,
+    W: FnMut() -> WFut,
+    WFut: Future<Output = NetworkAvailabilityWait>,
 {
     for attempt in 0..=policy.max_attempts {
         let req = make_req();
@@ -64,10 +81,174 @@ where
                     .retry_on
                     .should_retry(&err, attempt, policy.max_attempts) =>
             {
+                let _ = wait_for_network().await;
                 sleep(backoff(policy.base_delay, attempt + 1)).await;
             }
             Err(err) => return Err(err),
         }
     }
     Err(TransportError::RetryLimit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network_availability::NetworkAvailability;
+    use http::Method;
+    use pretty_assertions::assert_eq;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use tokio::sync::Notify;
+
+    fn retry_policy(base_delay: Duration) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 1,
+            base_delay,
+            retry_on: RetryOn {
+                retry_429: false,
+                retry_5xx: false,
+                retry_transport: true,
+            },
+        }
+    }
+
+    fn request() -> Request {
+        Request::new(Method::GET, "https://example.test".to_string())
+    }
+
+    fn available_wait(waited: bool) -> NetworkAvailabilityWait {
+        NetworkAvailabilityWait {
+            availability: NetworkAvailability::Available,
+            waited,
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_waits_for_network_before_next_attempt() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_op = Arc::clone(&attempts);
+        let wait_calls = Arc::new(AtomicUsize::new(0));
+        let wait_calls_for_wait = Arc::clone(&wait_calls);
+        let network_available = Arc::new(Notify::new());
+        let network_available_for_wait = Arc::clone(&network_available);
+
+        let task = tokio::spawn(run_with_retry_waiting_for_network(
+            retry_policy(Duration::ZERO),
+            request,
+            move |_, _| {
+                let attempts_for_op = Arc::clone(&attempts_for_op);
+                async move {
+                    let attempt = attempts_for_op.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Err(TransportError::Network("offline".to_string()))
+                    } else {
+                        Ok("ok")
+                    }
+                }
+            },
+            move || {
+                let wait_calls_for_wait = Arc::clone(&wait_calls_for_wait);
+                let network_available_for_wait = Arc::clone(&network_available_for_wait);
+                async move {
+                    wait_calls_for_wait.fetch_add(1, Ordering::SeqCst);
+                    network_available_for_wait.notified().await;
+                    available_wait(/*waited*/ true)
+                }
+            },
+        ));
+
+        while wait_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        network_available.notify_one();
+
+        assert_eq!(
+            task.await
+                .expect("retry task should not panic")
+                .expect("retry should succeed"),
+            "ok"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_treats_unknown_network_availability_as_non_blocking() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_op = Arc::clone(&attempts);
+
+        let result = run_with_retry_waiting_for_network(
+            retry_policy(Duration::ZERO),
+            request,
+            move |_, _| {
+                let attempts_for_op = Arc::clone(&attempts_for_op);
+                async move {
+                    let attempt = attempts_for_op.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Err(TransportError::Network("offline".to_string()))
+                    } else {
+                        Ok("ok")
+                    }
+                }
+            },
+            || async {
+                NetworkAvailabilityWait {
+                    availability: NetworkAvailability::Unknown,
+                    waited: false,
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(result.expect("retry should succeed"), "ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_applies_backoff_after_network_returns() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_op = Arc::clone(&attempts);
+        let network_available = Arc::new(Notify::new());
+        let network_available_for_wait = Arc::clone(&network_available);
+
+        let task = tokio::spawn(run_with_retry_waiting_for_network(
+            retry_policy(Duration::from_millis(40)),
+            request,
+            move |_, _| {
+                let attempts_for_op = Arc::clone(&attempts_for_op);
+                async move {
+                    let attempt = attempts_for_op.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Err(TransportError::Timeout)
+                    } else {
+                        Ok("ok")
+                    }
+                }
+            },
+            move || {
+                let network_available_for_wait = Arc::clone(&network_available_for_wait);
+                async move {
+                    network_available_for_wait.notified().await;
+                    available_wait(/*waited*/ true)
+                }
+            },
+        ));
+
+        while attempts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        network_available.notify_one();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            task.await
+                .expect("retry task should not panic")
+                .expect("retry should succeed"),
+            "ok"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
 }

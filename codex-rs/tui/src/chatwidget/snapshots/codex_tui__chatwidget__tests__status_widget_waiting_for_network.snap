@@ -1,0 +1,12 @@
+---
+source: tui/src/chatwidget/tests/status_and_layout.rs
+expression: normalized_backend_snapshot(terminal.backend())
+---
+"                                                                                "
+"• Waiting for network connection... (0s • esc to interrupt)                     "
+"  └ Stream disconnected before completion: network error                        "
+"                                                                                "
+"                                                                                "
+"› Ask Codex to do anything                                                      "
+"                                                                                "
+"  gpt-5.5 default · /tmp/project                                                "

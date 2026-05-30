@@ -13,9 +13,13 @@ pub(crate) mod sse;
 pub(crate) mod telemetry;
 
 pub use crate::requests::headers::build_session_headers;
+pub use codex_client::NetworkAvailability;
+pub use codex_client::NetworkAvailabilityWait;
 pub use codex_client::RequestTelemetry;
 pub use codex_client::ReqwestTransport;
 pub use codex_client::TransportError;
+pub use codex_client::current_network_availability;
+pub use codex_client::wait_for_network_availability;
 
 pub use crate::api_bridge::map_api_error;
 pub use crate::auth::AuthError;

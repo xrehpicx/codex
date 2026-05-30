@@ -11,6 +11,7 @@ use crate::hook_runtime::run_pre_compact_hooks;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::responses_retry::wait_for_network_before_stream_retry;
 #[cfg(test)]
 use crate::session::PreviousTurnSettings;
 use crate::session::session::Session;
@@ -270,6 +271,8 @@ async fn run_compact_task_inner_impl(
             }
             Err(e) => {
                 if retries < max_retries {
+                    wait_for_network_before_stream_retry(sess.as_ref(), turn_context.as_ref(), &e)
+                        .await;
                     retries += 1;
                     let delay = backoff(retries);
                     sess.notify_stream_error(

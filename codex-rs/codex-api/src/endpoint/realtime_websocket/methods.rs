@@ -17,6 +17,7 @@ use crate::error::ApiError;
 use crate::provider::Provider;
 use codex_client::backoff;
 use codex_client::maybe_build_rustls_client_config_with_custom_ca;
+use codex_client::wait_for_network_availability;
 use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::RealtimeTranscriptDelta;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
@@ -621,7 +622,15 @@ impl RealtimeWebsocketClient {
             match result {
                 Ok(connection) => return Ok(connection),
                 Err(err) if attempt < self.provider.retry.max_attempts => {
+                    let network_wait = wait_for_network_availability().await;
                     let delay = backoff(self.provider.retry.base_delay, attempt + 1);
+                    if network_wait.waited {
+                        warn!(
+                            attempt = attempt + 1,
+                            call_id,
+                            "local network was unavailable; retrying realtime sideband websocket connect after network returned"
+                        );
+                    }
                     warn!(
                         attempt = attempt + 1,
                         call_id,

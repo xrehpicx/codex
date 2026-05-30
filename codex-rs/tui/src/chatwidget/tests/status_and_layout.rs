@@ -1917,6 +1917,28 @@ async fn status_widget_active_snapshot() {
 }
 
 #[tokio::test]
+async fn status_widget_waiting_for_network_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.bottom_pane.set_task_running(/*running*/ true);
+    handle_stream_error(
+        &mut chat,
+        "Waiting for network connection...",
+        Some("stream disconnected before completion: network error".to_string()),
+    );
+
+    let height = chat.desired_height(/*width*/ 80);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, height))
+        .expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw status widget");
+    assert_chatwidget_snapshot!(
+        "status_widget_waiting_for_network",
+        normalized_backend_snapshot(terminal.backend())
+    );
+}
+
+#[tokio::test]
 async fn stream_error_updates_status_indicator() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.bottom_pane.set_task_running(/*running*/ true);
